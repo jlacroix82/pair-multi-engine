@@ -4,6 +4,15 @@
 for Ollama and LM Studio. Both are llama.cpp underneath, which leaves out most of
 how people actually serve models on a DGX Spark — vLLM, SGLang, TensorRT-LLM.
 
+**Read this first:** upstream is moving on both fronts. [PR #9](https://github.com/NVIDIA/Personal-AI-Router/pull/9)
+adds vLLM as a first-class bundled engine, including a `{model}` placeholder and
+an `engine:set-model` operation, which is a better answer than this adapter for
+vLLM specifically. [Issue #24](https://github.com/NVIDIA/Personal-AI-Router/issues/24)
+argues for adopting arbitrary OpenAI-compatible backends instead of adding
+runtimes one at a time. What remains useful here is the demonstration that an
+*unbundled* engine already works cluster-wide today, and the two gaps neither of
+those has closed.
+
 The good news, and the reason this repo is small: **PAIR's Go services already
 accept new engines.** Engines are declarative JSON manifests, not compiled-in
 cases. `nvpair-engine-manager` embeds its own manifests and then overlays
@@ -21,9 +30,13 @@ describes that shape well: point at a binary, declare a port, list the HTTP
 actions for `list_models`, `load_model` and so on.
 
 vLLM and SGLang bind one model for the lifetime of the process. Swapping models
-means restarting the server with different arguments, and a manifest cannot say
-that — `runtime.args` is static and `{model}` is not among the placeholders the
-runner will resolve. So `pair-vllm-engine` sits on one stable port that PAIR
+means restarting the server with different arguments, and in released builds a
+manifest cannot say that — `runtime.args` is static and `{model}` is not among
+the placeholders the runner resolves. (PR #9 adds exactly that placeholder plus
+`engine:set-model`; once it lands, a bundled engine no longer needs an adapter
+for this. The adapter still applies to engines PAIR does not bundle, and to
+backends that need a supervisor for other reasons — containers, for one.)
+So `pair-vllm-engine` sits on one stable port that PAIR
 talks to and owns the child engine underneath, which turns load and unload into
 real operations:
 
@@ -96,7 +109,10 @@ node card — no error and no broken rendering, just absence. That is what the c
 says should happen: `EngineTypes` is a closed literal union of `'ollama'` and
 `'lm-studio'`, narrowed via `isEngineType()` at the service-bridge boundary, and
 `DispatcherBackend` is the same two names again, so inference routing is closed
-too.
+too. PR #9 handles this by extending the enumeration
+(`Extract<EngineType, 'ollama' | 'lm-studio' | 'vllm'>`, `PROXY_ENGINES`) rather
+than opening it, so each new runtime still costs a UI change — which is the
+argument issue #24 is making.
 
 Three smaller things in the Go layer also stand in the way of engines beyond the
 two that ship.
@@ -114,8 +130,13 @@ be a manifest field.
 send a header, so an engine behind authentication cannot be driven by a manifest
 at all — Unsloth Studio, for instance, returns 401 on `/v1/models`.
 
-And `{model}` is not a resolvable placeholder in `runtime.args`, which is the gap
-this adapter exists to fill.
+And `{model}` is not a resolvable placeholder in `runtime.args` in released
+builds, which is the gap this adapter exists to fill — addressed upstream by
+PR #9, which is the right fix and supersedes the adapter for bundled engines.
+
+The first two, by contrast, are untouched by PR #9: its only timeout changes are
+unrelated test values, and it adds no header support. Both would still block a
+generic OpenAI-compatible backend.
 
 ## Operational notes
 
