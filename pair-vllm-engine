@@ -124,8 +124,16 @@ class Supervisor:
                 self.state = "ready"
                 return True, f"loaded {model} (mock)"
 
+            # No shell is used, so $(id -u) would be passed literally. {uid}/{gid}
+            # let a container backend run as the invoking user, which keeps it from
+            # writing root-owned files into mounted host caches.
             cmd = shlex.split(
-                self.cfg["command"].format(model=model, child_port=self.cfg["child_port"])
+                self.cfg["command"].format(
+                    model=model,
+                    child_port=self.cfg["child_port"],
+                    uid=os.getuid(),
+                    gid=os.getgid(),
+                )
             )
             # Child output goes to a file, not DEVNULL: when a launch fails the
             # reason is in here, and /load returns its tail so the caller sees

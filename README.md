@@ -144,6 +144,14 @@ Killing a `docker run` client does not stop the container, so container backends
 need `stop_command` (see `examples/vllm-docker.json`) or the GPU stays occupied
 after unload.
 
+Run containers as yourself. A `docker run` that mounts a host cache without
+`--user` writes into it as root, and every later non-container run against that
+cache then fails on permissions — which is tedious to diagnose, because it
+surfaces well into a model load. The command string is not run through a shell,
+so `$(id -u)` would be passed literally; use the `{uid}` and `{gid}` placeholders
+instead, as `examples/vllm-docker.json` does. Available placeholders are
+`{model}`, `{child_port}`, `{uid}` and `{gid}`.
+
 If native vLLM dies immediately with a permission error, check whether
 `~/.cache/vllm/flashinfer_autotune_cache` is root-owned from an earlier container
 run; `VLLM_CACHE_ROOT` points it somewhere writable.
