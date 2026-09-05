@@ -1,0 +1,8 @@
+{
+  "backend": "sglang",
+  "command": "python3 -m sglang.launch_server --model-path {model} --port {child_port} --host 127.0.0.1",
+  "child_port": 8801,
+  "ready_path": "/v1/models",
+  "ready_timeout_s": 900,
+  "models": []
+}

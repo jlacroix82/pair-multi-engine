@@ -1,0 +1,8 @@
+{
+  "backend": "vllm",
+  "command": "vllm serve {model} --port {child_port} --host 127.0.0.1 --gpu-memory-utilization 0.15 --max-model-len 4096 --enforce-eager",
+  "child_port": 8801,
+  "ready_path": "/v1/models",
+  "ready_timeout_s": 900,
+  "models": ["LiquidAI/LFM2.5-350M"]
+}

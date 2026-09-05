@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+"""
+pair-vllm-engine -- adapts a one-model-per-process engine (vLLM, SGLang) to the
+shape NVIDIA PAIR's engine-manager expects.
+
+PAIR's engine manifests assume an engine that hosts many models and loads them on
+demand -- Ollama and LM Studio both work that way. vLLM and SGLang bind a single
+model for the lifetime of the process, and a manifest cannot express "restart with
+a different model" because runtime.args are static and {model} is not an allowed
+placeholder.
+
+This process closes that gap. It presents one stable port to PAIR and owns the
+child engine underneath, so load_model/unload_model become real operations:
+
+    GET  /health          readiness + health probe (always up while we are)
+    GET  /v1/models       models this node can serve (OpenAI shape)
+    GET  /ps              currently resident model, for loaded_models
+    POST /load            {"model": "<id>"} -> (re)start the child on that model
+    POST /unload          stop the child, freeing VRAM
+    ANY  /v1/*            proxied to the running child
+
+Backends are declared in a JSON config so the same adapter serves vLLM, SGLang or
+anything else with an OpenAI-compatible server. --mock runs the state machine with
+no GPU, which is how the PAIR integration is tested without waiting on a real load.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shlex
+import signal
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+DEFAULT_CONFIG = {
+    "backend": "vllm",
+    # {model} is substituted per load. This is the piece a PAIR manifest cannot
+    # express today, which is the whole reason this adapter exists.
+    "command": "vllm serve {model} --port {child_port} --host 127.0.0.1",
+    "child_port": 8801,
+    "ready_path": "/v1/models",
+    "ready_timeout_s": 900,
+    "models": [],
+}
+
+
+class Supervisor:
+    """Owns at most one child engine process and the model it is serving."""
+
+    def __init__(self, cfg: dict, mock: bool = False):
+        self.cfg = cfg
+        self.mock = mock
+        self.proc: subprocess.Popen | None = None
+        self.model: str | None = None
+        self.state = "idle"          # idle | loading | ready | error
+        self.detail = ""
+        self.lock = threading.Lock()
+        self.log_path: str | None = None
+        self.logf = None
+
+    def _log_tail(self, n: int = 3) -> str:
+        """Last few lines of the child's output, for surfacing real launch errors."""
+        if not self.log_path:
+            return ""
+        try:
+            with open(self.log_path, "rb") as f:
+                lines = [l.decode(errors="replace").strip() for l in f if l.strip()]
+            return " | ".join(lines[-n:])[:400]
+        except OSError:
+            return ""
+
+    # -- child lifecycle ----------------------------------------------------
+    def _child_url(self, path: str = "") -> str:
+        return f"http://127.0.0.1:{self.cfg['child_port']}{path}"
+
+    def _wait_ready(self, deadline: float) -> bool:
+        url = self._child_url(self.cfg.get("ready_path", "/v1/models"))
+        while time.time() < deadline:
+            if self.proc and self.proc.poll() is not None:
+                self.detail = f"child exited rc={self.proc.returncode}"
+                return False
+            try:
+                with urllib.request.urlopen(url, timeout=2) as r:
+                    if r.status == 200:
+                        return True
+            except Exception:
+                pass
+            time.sleep(1.0)
+        self.detail = "timed out waiting for child readiness"
+        return False
+
+    def load_async(self, model: str) -> tuple[bool, str]:
+        """Begin a load and return immediately.
+
+        PAIR gives non-Ollama engines a 30s response-header timeout
+        (engineResponseHeaderTimeout in executor.go; the 10-minute client is
+        selected by `engine == "ollama"`), which no real model load fits inside.
+        So we ack the request and let the caller poll loaded_models.
+        """
+        with self.lock:
+            if self.state == "loading":
+                return False, f"already loading {self.model}"
+            if self.model == model and self.state == "ready":
+                return True, f"{model} already resident"
+        threading.Thread(target=self.load, args=(model,), daemon=True).start()
+        return True, f"loading {model}"
+
+    def load(self, model: str) -> tuple[bool, str]:
+        with self.lock:
+            if self.model == model and self.state == "ready":
+                return True, f"{model} already resident"
+            self._stop_locked()
+            self.state, self.model, self.detail = "loading", model, ""
+
+            if self.mock:
+                time.sleep(0.4)
+                self.state = "ready"
+                return True, f"loaded {model} (mock)"
+
+            cmd = shlex.split(
+                self.cfg["command"].format(model=model, child_port=self.cfg["child_port"])
+            )
+            # Child output goes to a file, not DEVNULL: when a launch fails the
+            # reason is in here, and /load returns its tail so the caller sees
+            # the real error instead of a bare exit code.
+            self.log_path = os.path.join(
+                self.cfg.get("log_dir", "/tmp"), f"pair-{self.cfg.get('backend','engine')}-child.log"
+            )
+            try:
+                self.logf = open(self.log_path, "wb")
+                self.proc = subprocess.Popen(
+                    cmd,
+                    stdout=self.logf,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+            except FileNotFoundError as e:
+                self.state, self.detail = "error", f"cannot exec {cmd[0]}: {e}"
+                return False, self.detail
+
+            ok = self._wait_ready(time.time() + int(self.cfg.get("ready_timeout_s", 900)))
+            if not ok:
+                tail = self._log_tail()
+                self._stop_locked()
+                self.state = "error"
+                msg = self.detail or "child failed to become ready"
+                return False, f"{msg}: {tail}" if tail else msg
+            if self.cfg.get("warmup", True):
+                self._warm(model)
+            self.state = "ready"
+            return True, f"loaded {model}"
+
+    def _warm(self, model: str) -> None:
+        """Issue one throwaway generation so the first real request is hot."""
+        body = json.dumps({"model": model,
+                           "messages": [{"role": "user", "content": "hi"}],
+                           "max_tokens": 1, "temperature": 0}).encode()
+        req = urllib.request.Request(self._child_url("/v1/chat/completions"),
+                                     data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+        t0 = time.time()
+        try:
+            with urllib.request.urlopen(req, timeout=int(self.cfg.get("warmup_timeout_s", 300))):
+                pass
+            print(f"warmup completed in {time.time()-t0:.1f}s", file=sys.stderr)
+        except Exception as e:
+            # Non-fatal: the model is loaded either way, the first call is just slower.
+            print(f"warmup skipped ({e})", file=sys.stderr)
+
+    def _stop_locked(self) -> None:
+        # Container backends need an explicit teardown: killing the `docker run`
+        # client leaves the container running, so a stop_command is the only way
+        # to actually free the GPU.
+        stop_cmd = self.cfg.get("stop_command")
+        if stop_cmd and (self.proc or self.state != "idle"):
+            try:
+                subprocess.run(shlex.split(stop_cmd), timeout=60,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception as e:
+                print(f"stop_command failed: {e}", file=sys.stderr)
+        if self.proc and self.proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+                for _ in range(40):
+                    if self.proc.poll() is not None:
+                        break
+                    time.sleep(0.25)
+                if self.proc.poll() is None:
+                    os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        self.proc = None
+        if self.logf:
+            try:
+                self.logf.close()
+            except OSError:
+                pass
+            self.logf = None
+        self.state = "idle"
+        self.model = None
+
+    def unload(self) -> tuple[bool, str]:
+        with self.lock:
+            was = self.model
+            self._stop_locked()
+            return True, f"unloaded {was}" if was else "nothing loaded"
+
+    # -- catalog ------------------------------------------------------------
+    def available(self) -> list[str]:
+        return list(self.cfg.get("models", []))
+
+    def resident(self) -> list[str]:
+        return [self.model] if (self.model and self.state == "ready") else []
+
+
+class Handler(BaseHTTPRequestHandler):
+    sup: Supervisor = None  # type: ignore[assignment]
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
+
+    def _send(self, code: int, payload: dict) -> None:
+        body = json.dumps(payload).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _proxy(self, method: str, body: bytes | None) -> None:
+        if not self.sup.resident():
+            self._send(503, {"error": "no model loaded; POST /load first"})
+            return
+        url = self.sup._child_url(self.path)
+        req = urllib.request.Request(url, data=body, method=method)
+        req.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(req, timeout=300) as r:
+                data = r.read()
+                self.send_response(r.status)
+                self.send_header("Content-Type", r.headers.get("Content-Type", "application/json"))
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+        except urllib.error.HTTPError as e:
+            data = e.read()
+            self.send_response(e.code)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except Exception as e:
+            self._send(502, {"error": f"upstream: {e}"})
+
+    def do_GET(self):
+        if self.path == "/health":
+            self._send(200, {"status": "ok", "engine": self.sup.cfg.get("backend"),
+                             "state": self.sup.state, "model": self.sup.model})
+        elif self.path.startswith("/v1/models"):
+            # Catalog, not just what is resident: PAIR lists these as installed.
+            self._send(200, {"object": "list",
+                             "data": [{"id": m, "object": "model", "owned_by": self.sup.cfg.get("backend", "vllm")}
+                                      for m in self.sup.available()]})
+        elif self.path == "/status":
+            self._send(200, {"state": self.sup.state, "model": self.sup.model,
+                             "detail": self.sup.detail})
+        elif self.path == "/ps":
+            self._send(200, {"models": [{"name": m} for m in self.sup.resident()]})
+        else:
+            self._proxy("GET", None)
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(n) if n else b""
+        if self.path == "/load":
+            try:
+                model = json.loads(raw or b"{}").get("model")
+            except json.JSONDecodeError:
+                self._send(400, {"error": "invalid JSON"}); return
+            if not model:
+                self._send(400, {"error": "'model' is required"}); return
+            ok, msg = self.sup.load_async(model)
+            self._send(202 if ok else 409,
+                       {"ok": ok, "detail": msg, "model": model, "state": self.sup.state})
+        elif self.path == "/unload":
+            ok, msg = self.sup.unload()
+            self._send(200, {"ok": ok, "detail": msg})
+        else:
+            self._proxy("POST", raw)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="PAIR engine adapter for vLLM/SGLang")
+    ap.add_argument("--port", type=int, default=8800, help="port PAIR talks to")
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--config", default=os.path.expanduser("~/.config/pair-multi-engine/vllm.json"))
+    ap.add_argument("--mock", action="store_true", help="simulate loads; no GPU, for integration tests")
+    a = ap.parse_args()
+
+    cfg = dict(DEFAULT_CONFIG)
+    try:
+        with open(a.config) as f:
+            cfg.update(json.load(f))
+    except FileNotFoundError:
+        print(f"no config at {a.config}; using defaults", file=sys.stderr)
+
+    sup = Supervisor(cfg, mock=a.mock)
+    Handler.sup = sup
+    srv = ThreadingHTTPServer((a.host, a.port), Handler)
+    print(f"pair-vllm-engine on {a.host}:{a.port} backend={cfg.get('backend')} "
+          f"mock={a.mock} models={len(sup.available())}", file=sys.stderr)
+
+    # shutdown() must run off the serve_forever() thread or it deadlocks, so the
+    # handler hands off rather than doing the work inline.
+    def bye(*_):
+        threading.Thread(target=srv.shutdown, daemon=True).start()
+    signal.signal(signal.SIGTERM, bye)
+    signal.signal(signal.SIGINT, bye)
+    try:
+        srv.serve_forever()
+    finally:
+        sup.unload()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

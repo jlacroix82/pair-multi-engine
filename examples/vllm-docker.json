@@ -1,0 +1,9 @@
+{
+  "backend": "vllm",
+  "command": "docker run --rm --name pair-vllm-child --gpus all --network host -v /home/USER/.cache/huggingface:/root/.cache/huggingface -e HF_HUB_OFFLINE=1 vllm-openai-ray:latest vllm serve {model} --port {child_port} --host 127.0.0.1 --gpu-memory-utilization 0.15 --max-model-len 4096 --enforce-eager",
+  "stop_command": "docker rm -f pair-vllm-child",
+  "child_port": 8801,
+  "ready_path": "/v1/models",
+  "ready_timeout_s": 900,
+  "models": ["LiquidAI/LFM2.5-350M"]
+}

@@ -1,0 +1,105 @@
+{
+  "engine": "vllm",
+  "display_name": "vLLM",
+  "manifest_version": 1,
+  "runtime": {
+    "bin": "{install_dir}/pair-vllm-engine",
+    "args": [
+      "--host",
+      "{host}",
+      "--port",
+      "{port}"
+    ],
+    "env": {
+      "HF_HUB_OFFLINE": "1",
+      "VLLM_LOGGING_LEVEL": "WARNING"
+    },
+    "bind": "127.0.0.1",
+    "port": 8800,
+    "ready": {
+      "http": "http://127.0.0.1:{port}/health",
+      "status": 200,
+      "timeout_s": 60
+    },
+    "health": {
+      "http": "http://127.0.0.1:{port}/health",
+      "status": 200,
+      "interval_s": 5
+    },
+    "stop": {
+      "signal": "term",
+      "grace_s": 15
+    }
+  },
+  "platforms": {
+    "linux/arm64": {
+      "detect": [
+        "{install_dir}/pair-vllm-engine"
+      ],
+      "runtime": {
+        "bin": "{install_dir}/pair-vllm-engine"
+      }
+    },
+    "linux/amd64": {
+      "detect": [
+        "{install_dir}/pair-vllm-engine"
+      ],
+      "runtime": {
+        "bin": "{install_dir}/pair-vllm-engine"
+      }
+    }
+  },
+  "actions": {
+    "list_models": {
+      "description": "Models this node can serve.",
+      "http": {
+        "method": "GET",
+        "path": "/v1/models"
+      },
+      "result": {
+        "array": "data",
+        "field": "id"
+      }
+    },
+    "loaded_models": {
+      "description": "Model currently resident in VRAM.",
+      "http": {
+        "method": "GET",
+        "path": "/ps"
+      },
+      "result": {
+        "array": "models",
+        "field": "name"
+      }
+    },
+    "load_model": {
+      "description": "Bring up vLLM on a model, replacing whatever was resident.",
+      "http": {
+        "method": "POST",
+        "path": "/load",
+        "body_schema": {
+          "model": "string"
+        }
+      }
+    },
+    "unload_model": {
+      "description": "Stop the vLLM child and free VRAM.",
+      "http": {
+        "method": "POST",
+        "path": "/unload",
+        "body_schema": {}
+      }
+    },
+    "run_model": {
+      "description": "One-shot chat completion against the resident model.",
+      "http": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "body_schema": {
+          "model": "string",
+          "messages": "array"
+        }
+      }
+    }
+  }
+}
