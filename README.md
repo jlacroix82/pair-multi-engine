@@ -1,4 +1,17 @@
-# vLLM as a third-party engine for NVIDIA Personal AI Router
+# vLLM and SGLang engines for NVIDIA Personal AI Router
+
+## Desktop GUI extension
+
+The [vLLM + SGLang PAIR branch](https://github.com/jlacroix82/Personal-AI-Router/tree/feat/vllm-sglang)
+extends upstream PR #9 with SGLang discovery, node-card visibility, model
+inventory, OpenAI proxy routing, and scheduler attribution. See
+[GUI setup](docs/gui-setup.md) for the two integration modes and build steps.
+The adapter manifests alone do not add engine rows to stock PAIR.
+
+For already-running cluster servers, use native adoption: vLLM defaults to
+8000 and SGLang to 30000, with each port configured on its hosting node.
+The adapters below remain useful when PAIR should own model load/unload through
+a stable wrapper port. They are optional and are not required for adoption.
 
 [NVIDIA PAIR](https://github.com/NVIDIA/Personal-AI-Router) ships engine support
 for Ollama and LM Studio. Both are llama.cpp underneath, which leaves out most of

@@ -1,0 +1,37 @@
+{
+  "engine": "sglang",
+  "display_name": "SGLang",
+  "manifest_version": 1,
+  "runtime": {
+    "bin": "{install_dir}/pair-vllm-engine",
+    "args": ["--host", "{host}", "--port", "{port}", "--config", "{install_dir}/sglang.json"],
+    "bind": "127.0.0.1",
+    "port": 8802,
+    "ready": { "http": "http://127.0.0.1:{port}/health", "status": 200, "timeout_s": 60 },
+    "health": { "http": "http://127.0.0.1:{port}/health", "status": 200, "interval_s": 5 },
+    "stop": { "signal": "term", "grace_s": 15 }
+  },
+  "platforms": {
+    "linux/arm64": { "detect": ["{install_dir}/pair-vllm-engine"] },
+    "linux/amd64": { "detect": ["{install_dir}/pair-vllm-engine"] }
+  },
+  "actions": {
+    "list_models": {
+      "http": { "method": "GET", "path": "/v1/models" },
+      "result": { "array": "data", "field": "id" }
+    },
+    "loaded_models": {
+      "http": { "method": "GET", "path": "/ps" },
+      "result": { "array": "models", "field": "name" }
+    },
+    "load_model": {
+      "http": { "method": "POST", "path": "/load", "body_schema": { "model": "string" } }
+    },
+    "unload_model": {
+      "http": { "method": "POST", "path": "/unload", "body_schema": {} }
+    },
+    "run_model": {
+      "http": { "method": "POST", "path": "/v1/chat/completions", "body_schema": { "model": "string", "messages": "array" } }
+    }
+  }
+}
