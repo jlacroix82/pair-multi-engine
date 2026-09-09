@@ -3,6 +3,7 @@
   "display_name": "SGLang",
   "manifest_version": 1,
   "runtime": {
+    "identity": { "http": "http://127.0.0.1:{port}/health", "json_string": "engine", "json_value": "sglang" },
     "bin": "{install_dir}/pair-vllm-engine",
     "args": ["--host", "{host}", "--port", "{port}", "--config", "{install_dir}/sglang.json"],
     "bind": "127.0.0.1",

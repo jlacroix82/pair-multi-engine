@@ -7,6 +7,16 @@ same branch on participating nodes. Stock PAIR still filters unknown engines.
 
 ## Existing cluster deployments
 
+The preview now distinguishes external process ownership, requires native
+engine-specific identity, and supports a local head/worker/capability policy.
+See [external deployment setup](https://github.com/jlacroix82/Personal-AI-Router/blob/feat/vllm-sglang/docs/external-deployments.mdx).
+Build and use the same preview on every participating host. Worker nodes are not
+independent endpoints; an embedding-only vLLM must not be benchmarked as chat.
+
+When switching from an adapter to a native server, back up and replace the entire
+adapter override outside PAIR's `engines` directory. Merely changing its port
+leaves the wrapper executable, actions, and platform overrides active.
+
 This is the intended mode for servers already managed by systemd, Docker, or
 another runtime supervisor. No adapter installation is needed.
 
